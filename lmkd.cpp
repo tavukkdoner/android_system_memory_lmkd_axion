@@ -241,6 +241,9 @@ static bool delay_monitors_until_boot;
 static int direct_reclaim_threshold_ms;
 static int swap_compression_ratio;
 static int lowmem_min_oom_score;
+static bool exclude_tasknames;
+static char **taskname_dict = NULL;
+static int exclude_tasknames_len = 0;
 static struct psi_threshold psi_thresholds[VMPRESS_LEVEL_COUNT] = {
     { PSI_SOME, 70 },    /* 70ms out of 1sec for partial stall */
     { PSI_SOME, 100 },   /* 100ms out of 1sec for partial stall */
@@ -2413,6 +2416,77 @@ static void start_wait_for_proc_kill(int pid_or_fd) {
     maxevents++;
 }
 
+/* Init excluded process list */
+static char ** init_excluded_list(void) {
+    ALOGI("Start init excluded list");
+    char *tasknames;
+    char *token;
+    char do_not_kill_tasknames[PROPERTY_VALUE_MAX]; //92
+	
+    property_get("ro.lmk.excluded_tasknames", do_not_kill_tasknames, "");
+	
+    int len = strlen(do_not_kill_tasknames);
+    if (len == 0) {
+        ALOGI("Excluded list is empty");
+        exclude_tasknames = false;
+        return NULL;
+    }
+    int num_tasknames = 0;
+    bool is_killable = true;
+
+    tasknames = (char * ) malloc((len + 1) * sizeof(char));
+    tasknames[len] = '\0';
+
+
+    strncpy(tasknames, do_not_kill_tasknames, len);
+
+    /* Count the number of tasknames */
+    token = strtok(tasknames, ",");
+    while (token != NULL) {
+        num_tasknames++;
+        token = strtok(NULL, ",");
+    }
+    strncpy(tasknames, do_not_kill_tasknames, len);
+	
+    exclude_tasknames_len = num_tasknames;
+
+    /* Allocate memory for the array */
+    char **taskname_dict_init = new char *[num_tasknames];
+
+    /* Split the tasknames and store */
+    int i = 0;
+    token = strtok(tasknames, ",");
+
+    while (token != NULL) {
+        taskname_dict_init[i++] = strdup(token);
+        token = strtok(NULL, ",");
+    }
+
+    free(tasknames);
+    tasknames = NULL;
+	
+    ALOGI("End init excluded list");
+
+    return taskname_dict_init;
+}
+
+/* If the package name is among the excluded ones, skip it without killing it. */
+static bool is_not_excluded(char *taskname) {
+    bool is_killable = true;
+
+    if (taskname_dict != NULL) {
+        /* Check if is not killable */
+        for (int i = 0; i < exclude_tasknames_len; i++) {
+            if (!strncmp(taskname, taskname_dict[i], strlen(taskname_dict[i]))) {
+                is_killable = false;
+                break;
+            }
+        }
+    }
+
+    return is_killable;
+}
+
 /* Kill one process specified by procp.  Returns the size (in pages) of the process killed */
 static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_info *ki,
                             union meminfo *mi, struct wakeup_info *wi, struct timespec *tm,
@@ -2455,6 +2529,10 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     if (!taskname) {
         goto out;
     }
+	
+    if (exclude_tasknames && !is_not_excluded(taskname)){
+    	goto out;
+    }	
 
     mem_st = stats_read_memory_stat(per_app_memcg, pid, uid, rss_kb * 1024, swap_kb * 1024);
 
@@ -4098,6 +4176,10 @@ static bool update_props() {
             std::max(PERCEPTIBLE_APP_ADJ + 1,
                      GET_LMK_PROPERTY(int32, "lowmem_min_oom_score", DEF_LOWMEM_MIN_SCORE));
 
+    exclude_tasknames = GET_LMK_PROPERTY(bool, "exclude_tasknames", false);
+    if (exclude_tasknames) {
+        taskname_dict = init_excluded_list();
+    }
     reaper.enable_debug(debug_process_killing);
 
     /* Call the update props hook */
@@ -4167,6 +4249,14 @@ int main(int argc, char **argv) {
         mainloop();
     }
 
+    if (taskname_dict != NULL) {
+        for (int i = 0; i < exclude_tasknames_len; i++) {
+            free(taskname_dict[i]);
+        }
+        free(taskname_dict);
+        taskname_dict = NULL;
+    }
+	
     android_log_destroy(&ctx);
 
     ALOGI("exiting");
