@@ -119,7 +119,7 @@ static void* reaper_main(void* param) {
         }
     };
  
-    parseCpusets(android::base::GetProperty("persist.sys.axion_cpu_big", "4,5,6,7"), big_cores);
+    parseCpusets(android::base::GetProperty("persist.sys.axion_cpu_big", "0,1,2,3"), big_cores);
  
     for (int core : big_cores) {
         CPU_SET(core, &cpuset);
