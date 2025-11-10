@@ -466,6 +466,11 @@ void SimpleLmk::scan_and_kill() {
         
         char comm[256];
         get_process_name(pid, comm, sizeof(comm));
+		
+        if (!strncmp("com.wstxda.viper4android", comm, strlen(comm))) {
+            ALOGD("SLMK: Process %s is excluded", comm);
+            continue;
+        }
         
         ALOGI("SLMK: Killing %s (pid %d, adj %d) to free %lu KB",
               comm, pid, victim->adj, victim->rss);
