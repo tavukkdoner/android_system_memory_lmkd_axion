@@ -44,7 +44,7 @@
 #include "slmk.h"
 
 #define NS_PER_MS (NS_PER_SEC / MS_PER_SEC)
-#define SLMK_PER_RECLAIM_MIN (256UL * 1024UL)
+#define SLMK_PER_RECLAIM_MIN (128UL * 1024UL)
 #define THREAD_POOL_SIZE 2
 #define RECLAIM_TIMEOUT_MS 200
 #define VM_PRESSURE_CRITICAL 100
@@ -330,7 +330,7 @@ static unsigned long find_victims(int* vindex) {
         
         int adj = get_oom_score_adj(pid);
         
-        if (adj < 0 || is_process_dying(pid)) {
+        if (adj <= 0 || is_process_dying(pid)) {
             continue;
         }
         
