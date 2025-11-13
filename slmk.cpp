@@ -165,7 +165,7 @@ static int vmpressure_parse_file(const char* filename, union vmpressure* vp) {
     return 0;
 }
 
-static bool is_system_under_pressure() {
+static bool is_memory_under_pressure() {
     union vmpressure mem, cpu, io;
     double mem_p = 0, cpu_p = 0, io_p = 0;
 
@@ -173,27 +173,9 @@ static bool is_system_under_pressure() {
         mem_p = std::max(mem.field.full_avg10, mem.field.some_avg10);
     }
 
-    if (vmpressure_parse_file("/proc/pressure/cpu", &cpu) == 0) {
-        cpu_p = std::max(cpu.field.full_avg10, cpu.field.some_avg10);
-    }
+    ALOGI("SLMK: mem=%.2f", mem_p);
 
-    if (vmpressure_parse_file("/proc/pressure/io", &io) == 0) {
-        io_p = std::max(io.field.full_avg10, io.field.some_avg10);
-    }
-
-    double system_p = (mem_p * 0.6) + (cpu_p * 0.25) + (io_p * 0.15);
-
-    if (system_p > 100.0) system_p = 100.0;
-    if (system_p < 0.0) system_p = 0.0;
-
-    int pressure = static_cast<int>(system_p + 0.5);
-
-    ALOGI("SLMK: pressure(mem=%.2f cpu=%.2f io=%.2f) => system=%d%%",
-          mem_p, cpu_p, io_p, pressure);
-
-    bool pressured = (mem_p >= 100.0) || (cpu_p > 50.0) || (io_p > 50.0);
-
-    return pressured;
+    return mem_p >= 100.0;
 }
 
 static int get_oom_score_adj(pid_t pid) {
@@ -637,8 +619,8 @@ void* slmk_main(void* param) {
     for (;;) {
         sleep(1);
 
-        if (is_system_under_pressure()) {
-            ALOGI("SLMK: system under pressure. scanning");
+        if (is_memory_under_pressure()) {
+            ALOGI("SLMK: memory pressure. scanning");
             bool expected = false;
             if (slmk->reclaim_pending_.compare_exchange_strong(expected, true)) {
                 slmk->scan_and_kill();
