@@ -165,17 +165,65 @@ static int vmpressure_parse_file(const char* filename, union vmpressure* vp) {
     return 0;
 }
 
+static unsigned long parse_meminfo_field_kb(const char* key) {
+    char* buf = reread_file("/proc/meminfo");
+    if (!buf) {
+        ALOGE("SLMK: Failed to read /proc/meminfo");
+        return 0;
+    }
+
+    unsigned long value_kb = 0;
+    char* save_ptr;
+    for (char* line = strtok_r(buf, "\n", &save_ptr); line;
+         line = strtok_r(nullptr, "\n", &save_ptr)) {
+        if (strncmp(line, key, strlen(key)) == 0) {
+            const char* p = line + strlen(key);
+            while (*p && (*p == ':' || *p == ' ' || *p == '\t')) p++;
+            value_kb = strtoul(p, nullptr, 10);
+            break;
+        }
+    }
+    free(buf);
+    return value_kb;
+}
+
 static bool is_memory_under_pressure() {
-    union vmpressure mem, cpu, io;
-    double mem_p = 0, cpu_p = 0, io_p = 0;
+    union vmpressure mem;
+    double mem_p = 0.0;
 
     if (vmpressure_parse_file("/proc/pressure/memory", &mem) == 0) {
         mem_p = std::max(mem.field.full_avg10, mem.field.some_avg10);
     }
 
-    ALOGI("SLMK: mem=%.2f", mem_p);
+    if (mem_p >= 1.0)
+        return mem_p >= VM_PRESSURE_CRITICAL;
 
-    return mem_p >= 100.0;
+    unsigned long mem_available = parse_meminfo_field_kb("MemAvailable");
+    unsigned long mem_total = parse_meminfo_field_kb("MemTotal");
+    unsigned long inactive_file = parse_meminfo_field_kb("Inactive(file)");
+    unsigned long inactive_anon = parse_meminfo_field_kb("Inactive(anon)");
+    unsigned long k_reclaimable = parse_meminfo_field_kb("KReclaimable");
+    unsigned long unevictable = parse_meminfo_field_kb("Unevictable");
+    unsigned long swap_total = parse_meminfo_field_kb("SwapTotal");
+    unsigned long swap_free = parse_meminfo_field_kb("SwapFree");
+
+    double avail_frac = (double)mem_available / (double)mem_total;
+    double reclaimable_pool =
+        (double)(inactive_file + inactive_anon + k_reclaimable);
+    double reclaimable_frac = reclaimable_pool / (double)mem_total;
+    double swap_free_frac = swap_total ? (double)swap_free / (double)swap_total : 1.0;
+
+    bool no_reclaimable =
+        reclaimable_frac < 0.01 && k_reclaimable < 128 * 1024;
+
+    bool low_avail =
+        avail_frac < 0.05 || (swap_total && swap_free_frac < 0.10);
+
+    if (no_reclaimable && low_avail) {
+        mem_p = 100.0;
+    }
+
+    return mem_p >= VM_PRESSURE_CRITICAL;
 }
 
 static int get_oom_score_adj(pid_t pid) {
