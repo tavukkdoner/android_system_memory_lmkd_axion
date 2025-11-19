@@ -2815,8 +2815,20 @@ static void __mp_event_psi(enum event_source source, union psi_event_data data,
                            uint32_t events, struct polling_params *poll_params) {
     if (slmk_enabled) {
         ALOGD("SLMK: skipping psi events!");
+        if (source == PSI) {
+            enum vmpressure_level vmpressure_level = data.level;
+            if (events > 0) {
+                if (vmpressure_level < prev_level)
+                    return;
+                prev_level = vmpressure_level;
+            } else {
+                prev_level = VMPRESS_LEVEL_LOW;
+            }
+            slmk.mp_event_psi(vmpressure_level);
+        }
         return;
     }
+
     enum reclaim_state {
         NO_RECLAIM = 0,
         KSWAPD_RECLAIM,

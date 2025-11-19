@@ -44,12 +44,17 @@
 #include "slmk.h"
 
 #define NS_PER_MS (NS_PER_SEC / MS_PER_SEC)
-#define SLMK_PER_RECLAIM_MIN (128UL * 1024UL)
 #define THREAD_POOL_SIZE 2
 #define RECLAIM_TIMEOUT_MS 200
 #define VM_PRESSURE_CRITICAL 100
 #define ALLOCSTALL_SIGNIFICANT_THRESHOLD 1000ULL
 #define PAGE_ALLOC_COSTLY_ORDER 3
+#define VMPRESS_LEVEL_LOW 0
+#define VMPRESS_LEVEL_MEDIUM 1
+#define VMPRESS_LEVEL_CRITICAL 2
+#define PERCEPTIBLE_APP_ADJ 200
+#define PREVIOUS_APP_ADJ 700
+#define LOW_MEM_ADJ_CUT_OFF 0
 
 static Reaper* reaper_instance = nullptr;
 
@@ -58,6 +63,7 @@ static std::atomic<int> nr_victims(0);
 static std::atomic<int> nr_killed(0);
 static std::atomic<bool> reclaim_active(false);
 static pthread_mutex_t victims_lock = PTHREAD_MUTEX_INITIALIZER;
+static int current_pressure_level = 0;
 
 static inline long get_time_diff_ms(struct timespec* from, struct timespec* to) {
     return (to->tv_sec - from->tv_sec) * 1000L +
@@ -414,94 +420,137 @@ static void get_process_name(pid_t pid, char* name, size_t len) {
     free(buf);
 }
 
-static unsigned long find_victims(int* vindex) {
+unsigned long SimpleLmk::find_victims(int* vindex) {
     std::map<short, std::vector<proc_info>> task_bucket;
     short min_adj = SHRT_MAX;
     short max_adj = 0;
     unsigned long pages_found = 0;
     
+    int adj_cut_off = PREVIOUS_APP_ADJ + 1;
+    if (current_pressure_level == VMPRESS_LEVEL_MEDIUM) {
+        adj_cut_off = PERCEPTIBLE_APP_ADJ + 1;
+    } else if (current_pressure_level == VMPRESS_LEVEL_CRITICAL) {
+        adj_cut_off = LOW_MEM_ADJ_CUT_OFF;
+    }
+
     DIR* d = opendir("/proc");
     if (!d) {
         ALOGE("Failed to open /proc: %s", strerror(errno));
         return 0;
     }
-    
+
     struct dirent* de;
     while ((de = readdir(d))) {
         if (de->d_type != DT_DIR) continue;
         pid_t pid = atoi(de->d_name);
         if (pid <= 0) continue;
-        
+
         if (!is_pid_alive(pid)) continue;
-        
+
         int adj = get_oom_score_adj(pid);
-        
-        if (adj <= 0 || is_process_dying(pid)) {
+
+        if (adj <= adj_cut_off || is_process_dying(pid)) {
             continue;
         }
-        
+
         unsigned long rss_kb = get_task_rss_kb(pid);
         uid_t uid = get_task_uid(pid);
-        
+
         proc_info p = {pid, adj, rss_kb, uid, 0};
         task_bucket[adj].push_back(p);
-        
+
         if (adj > max_adj) max_adj = adj;
         if (adj < min_adj) min_adj = adj;
     }
     closedir(d);
-    
+
     if (task_bucket.empty()) {
         ALOGW("No killable processes found");
         return 0;
     }
-    
-    ALOGI("Scanning from adj %d to %d", max_adj, min_adj);
-    
+
+    unsigned long target = reclaim_target_kb_.load();
+    std::vector<proc_info> small_victims;
+    std::vector<proc_info> big_victims;
+
+    ALOGI("Scanning from adj %d to %d (reclaim target %lu KB)",
+          max_adj, min_adj, target);
+
     for (short adj = max_adj; adj >= min_adj; adj--) {
         auto it = task_bucket.find(adj);
         if (it == task_bucket.end()) continue;
-        
-        auto& bucket = it->second;
-        int old_vindex = *vindex;
-        
-        for (auto& p : bucket) {
-            if (*vindex >= SLMK_MAX_VICTIMS) break;
-            
-            victims_array[*vindex] = p;
-            pages_found += p.rss;
-            (*vindex)++;
-        }
-        
-        if (*vindex == old_vindex) continue;
-        
-        std::sort(victims_array.begin() + old_vindex,
-                 victims_array.begin() + *vindex,
-                 [](const proc_info& a, const proc_info& b) {
-                     return a.rss > b.rss;
-                 });
-        
-        if (*vindex >= SLMK_MAX_VICTIMS || pages_found >= SLMK_PER_RECLAIM_MIN) {
-            break;
+
+        for (auto& p : it->second) {
+            if (p.rss <= target)
+                small_victims.push_back(p);
+            else
+                big_victims.push_back(p);
         }
     }
-    
+
+    std::sort(small_victims.begin(), small_victims.end(),
+              [](const proc_info& a, const proc_info& b) {
+                  return a.rss > b.rss;
+              });
+
+    std::sort(big_victims.begin(), big_victims.end(),
+              [](const proc_info& a, const proc_info& b) {
+                  return a.rss < b.rss;
+              });
+
+    *vindex = 0;
+    victims_array.clear();
+    victims_array.resize(SLMK_MAX_VICTIMS);
+
+    pages_found = 0;
+
+    for (auto& p : small_victims) {
+        if (*vindex >= SLMK_MAX_VICTIMS)
+            break;
+        victims_array[*vindex] = p;
+        pages_found += p.rss;
+        (*vindex)++;
+    }
+
+    for (auto& p : big_victims) {
+        if (*vindex >= SLMK_MAX_VICTIMS)
+            break;
+        victims_array[*vindex] = p;
+        pages_found += p.rss;
+        (*vindex)++;
+    }
+
     return pages_found;
 }
 
-static int process_victims(int vlen, [[maybe_unused]] unsigned long pages_found) {
-    int nr_to_kill = 0;
-    unsigned long pages_sum = 0;
-    
+int SimpleLmk::process_victims(int vlen) {
+    unsigned long target = reclaim_target_kb_.load();
+    unsigned long collected = 0;
+    int count = 0;
+
     for (int i = 0; i < vlen; i++) {
-        if (pages_sum >= SLMK_PER_RECLAIM_MIN) {
-            break;
-        }
-        pages_sum += victims_array[i].rss;
-        nr_to_kill++;
+        if (victims_array[i].rss > target)
+            continue;
+
+        collected += victims_array[i].rss;
+        count++;
+
+        if (collected >= target)
+            return count;
     }
-    
-    return nr_to_kill;
+
+    for (int i = 0; i < vlen; i++) {
+        if (victims_array[i].rss <= target)
+            continue;
+
+        collected += victims_array[i].rss;
+        count++;
+
+        if (collected >= target)
+            break;
+    }
+
+    return count;
 }
 
 static void set_task_rt_prio(pid_t pid, int priority) {
@@ -538,8 +587,9 @@ void SimpleLmk::scan_and_kill() {
     
     ALOGI("Found %d potential victims (%lu KB)", nr_found, pages_found);
     
-    if (pages_found > SLMK_PER_RECLAIM_MIN) {
-        nr_to_kill = process_victims(nr_found, pages_found);
+    unsigned long target = reclaim_target_kb_.load();
+    if (pages_found > target) {
+        nr_to_kill = process_victims(nr_found);
         
         ALOGI("First pass wants to kill %d victims", nr_to_kill);
         
@@ -548,7 +598,7 @@ void SimpleLmk::scan_and_kill() {
                      return a.rss > b.rss;
                  });
         
-        nr_to_kill = process_victims(nr_to_kill, pages_found);
+        nr_to_kill = process_victims(nr_to_kill);
         
         ALOGI("After optimization, killing %d victims", nr_to_kill);
     } else {
@@ -595,6 +645,7 @@ void SimpleLmk::scan_and_kill() {
                 int result = reaper_instance->kill({pidfd, pid, victim->uid}, false);
                 if (result == 0) {
                     ALOGD("Reaper took pid %d", pid);
+                    nr_killed.fetch_add(1);
                 } else {
                     ALOGW("Reaper failed for pid %d", pid);
                     close(pidfd);
@@ -687,6 +738,31 @@ bool SimpleLmk::init(int comm_fd) {
     victims_array.resize(SLMK_MAX_VICTIMS);
     ALOGI("Initialized with %d threads", thread_cnt_);
     return true;
+}
+
+void SimpleLmk::mp_event_psi(int level) {
+    unsigned long base = SLMK_PER_RECLAIM_MIN;
+
+    if (level == VMPRESS_LEVEL_LOW) {
+        reclaim_target_kb_.store(base / 2);
+        ALOGI("PSI: LOW event → reclaim target = %lu KB", base / 2);
+    } else if (level == VMPRESS_LEVEL_MEDIUM) {
+        reclaim_target_kb_.store(base);
+        ALOGI("PSI: MED event → reclaim target = %lu KB", base);
+    } else if (level == VMPRESS_LEVEL_CRITICAL) {
+        reclaim_target_kb_.store(base * 2);
+        ALOGI("PSI: HIGH event → reclaim target = %lu KB", base);
+    }
+    
+    current_pressure_level = level;
+
+    bool expected = false;
+    if (reclaim_pending_.compare_exchange_strong(expected, true)) {
+        scan_and_kill();
+        reclaim_pending_.store(false);
+    } else {
+        ALOGD("SLMK PSI: Reclaim already in progress");
+    }
 }
 
 void* slmk_main(void* param) {

@@ -8,6 +8,7 @@
 #include <limits.h>
 
 #define SLMK_MAX_VICTIMS 1024
+#define SLMK_PER_RECLAIM_MIN (128UL * 1024UL)
 
 struct proc_info {
     pid_t pid;
@@ -36,10 +37,17 @@ public:
 
     std::atomic<bool> reclaim_pending_;
     int comm_fd_;
+    
+    void mp_event_psi(int level);
 
 private:
     pthread_t* thread_pool_;
     int thread_cnt_;
+    std::atomic<unsigned long> reclaim_target_kb_{SLMK_PER_RECLAIM_MIN};
+    std::vector<proc_info> small_victims;
+    std::vector<proc_info> big_victims;
+    unsigned long find_victims(int* vindex);
+    int process_victims(int vlen);
 };
 
 void* slmk_main(void* param);
