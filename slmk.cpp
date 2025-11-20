@@ -426,12 +426,7 @@ unsigned long SimpleLmk::find_victims(int* vindex) {
     short max_adj = 0;
     unsigned long pages_found = 0;
     
-    int adj_cut_off = PREVIOUS_APP_ADJ + 1;
-    if (current_pressure_level == VMPRESS_LEVEL_MEDIUM) {
-        adj_cut_off = PERCEPTIBLE_APP_ADJ + 1;
-    } else if (current_pressure_level == VMPRESS_LEVEL_CRITICAL) {
-        adj_cut_off = LOW_MEM_ADJ_CUT_OFF;
-    }
+    int adj_cut_off = LOW_MEM_ADJ_CUT_OFF;
 
     DIR* d = opendir("/proc");
     if (!d) {
