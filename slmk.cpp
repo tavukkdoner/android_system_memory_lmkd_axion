@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#define LOG_TAG "SimpleLMK"
+#define LOG_TAG "USLMK"
 
 #include <android-base/properties.h>
 #include <dirent.h>
@@ -48,6 +48,8 @@
 #define THREAD_POOL_SIZE 2
 #define RECLAIM_TIMEOUT_MS 200
 #define VM_PRESSURE_CRITICAL 100
+#define ALLOCSTALL_SIGNIFICANT_THRESHOLD 1000ULL
+#define PAGE_ALLOC_COSTLY_ORDER 3
 
 static Reaper* reaper_instance = nullptr;
 
@@ -127,7 +129,7 @@ union vmpressure {
 static int vmpressure_parse_file(const char* filename, union vmpressure* vp) {
     char* buf = reread_file(filename);
     if (!buf) {
-        ALOGE("SLMK: Failed to read %s", filename);
+        ALOGE("Failed to read %s", filename);
         return -1;
     }
 
@@ -158,17 +160,40 @@ static int vmpressure_parse_file(const char* filename, union vmpressure* vp) {
     free(buf);
 
     if (!found_some && !found_full) {
-        ALOGE("SLMK: Failed to parse pressure metrics from %s", filename);
+        ALOGE("Failed to parse pressure metrics from %s", filename);
         return -1;
     }
 
     return 0;
 }
 
+static unsigned long long parse_vmstat_field_ull(const char* key) {
+    char* buf = reread_file("/proc/vmstat");
+    if (!buf) {
+        ALOGE("Failed to read /proc/meminfo");
+        return 0;
+    }
+
+    unsigned long long value = 0;
+    char* save_ptr;
+    size_t keylen = strlen(key);
+    for (char* line = strtok_r(buf, "\n", &save_ptr); line;
+         line = strtok_r(nullptr, "\n", &save_ptr)) {
+        if (strncmp(line, key, keylen) == 0) {
+            const char* p = line + keylen;
+            while (*p && (*p == ' ' || *p == '\t')) p++;
+            value = strtoull(p, nullptr, 10);
+            break;
+        }
+    }
+    free(buf);
+    return value;
+}
+
 static unsigned long parse_meminfo_field_kb(const char* key) {
     char* buf = reread_file("/proc/meminfo");
     if (!buf) {
-        ALOGE("SLMK: Failed to read /proc/meminfo");
+        ALOGE("Failed to read /proc/meminfo");
         return 0;
     }
 
@@ -187,40 +212,91 @@ static unsigned long parse_meminfo_field_kb(const char* key) {
     return value_kb;
 }
 
+static void read_vmstat_allocstall(unsigned long long* allocstall_total,
+                                   unsigned long long* pgsteal_direct,
+                                   unsigned long long* pgsteal_kswapd) {
+    unsigned long long normal = parse_vmstat_field_ull("allocstall_normal");
+    unsigned long long movable = parse_vmstat_field_ull("allocstall_movable");
+    unsigned long long device = parse_vmstat_field_ull("allocstall_device");
+    unsigned long long dma32 = parse_vmstat_field_ull("allocstall_dma32");
+    unsigned long long dma = parse_vmstat_field_ull("allocstall_dma");
+
+    unsigned long long costly_allocs = parse_vmstat_field_ull("pgskip_normal") +
+                                       parse_vmstat_field_ull("pgskip_movable") +
+                                       parse_vmstat_field_ull("pgskip_device") +
+                                       parse_vmstat_field_ull("pgskip_dma32") +
+                                       parse_vmstat_field_ull("pgskip_dma");
+
+    if (allocstall_total) {
+        *allocstall_total = normal + movable + device + dma32 + dma;
+
+        if (*allocstall_total <= costly_allocs) {
+            *allocstall_total = 0;
+        } else {
+            *allocstall_total -= costly_allocs;
+        }
+    }
+
+    if (pgsteal_direct)
+        *pgsteal_direct = parse_vmstat_field_ull("pgsteal_direct");
+    if (pgsteal_kswapd)
+        *pgsteal_kswapd = parse_vmstat_field_ull("pgsteal_kswapd");
+}
+
+static bool reclaim_active_in_slow_path() {
+    unsigned long long allocstall_total = 0;
+    unsigned long long pgsteal_direct = 0;
+    unsigned long long pgsteal_kswapd = 0;
+
+    read_vmstat_allocstall(&allocstall_total, &pgsteal_direct, &pgsteal_kswapd);
+
+    return allocstall_total > 0;
+}
+
 static bool is_memory_under_pressure() {
     union vmpressure mem;
     double mem_p = 0.0;
 
-    if (vmpressure_parse_file("/proc/pressure/memory", &mem) == 0) {
+    bool vp_read_ok = (vmpressure_parse_file("/proc/pressure/memory", &mem) == 0);
+
+    if (vp_read_ok && reclaim_active_in_slow_path()) {
         mem_p = std::max(mem.field.full_avg10, mem.field.some_avg10);
+    } else {
+        mem_p = 0.0;
     }
 
-    if (mem_p >= 1.0)
+    if (mem_p >= 1.0) {
         return mem_p >= VM_PRESSURE_CRITICAL;
+    }
 
     unsigned long mem_available = parse_meminfo_field_kb("MemAvailable");
     unsigned long mem_total = parse_meminfo_field_kb("MemTotal");
     unsigned long inactive_file = parse_meminfo_field_kb("Inactive(file)");
     unsigned long inactive_anon = parse_meminfo_field_kb("Inactive(anon)");
     unsigned long k_reclaimable = parse_meminfo_field_kb("KReclaimable");
-    unsigned long unevictable = parse_meminfo_field_kb("Unevictable");
     unsigned long swap_total = parse_meminfo_field_kb("SwapTotal");
     unsigned long swap_free = parse_meminfo_field_kb("SwapFree");
 
     double avail_frac = (double)mem_available / (double)mem_total;
-    double reclaimable_pool =
-        (double)(inactive_file + inactive_anon + k_reclaimable);
+    double reclaimable_pool = (double)(inactive_file + inactive_anon + k_reclaimable);
     double reclaimable_frac = reclaimable_pool / (double)mem_total;
     double swap_free_frac = swap_total ? (double)swap_free / (double)swap_total : 1.0;
 
-    bool no_reclaimable =
-        reclaimable_frac < 0.01 && k_reclaimable < 128 * 1024;
-
-    bool low_avail =
-        avail_frac < 0.05 || (swap_total && swap_free_frac < 0.10);
+    bool no_reclaimable = reclaimable_frac < 0.01 && k_reclaimable < 128 * 1024;
+    bool low_avail = avail_frac < 0.05 || (swap_total && swap_free_frac < 0.10);
 
     if (no_reclaimable && low_avail) {
-        mem_p = 100.0;
+        unsigned long long allocstall_total = 0;
+        unsigned long long pgsteal_direct = 0;
+        unsigned long long pgsteal_kswapd = 0;
+
+        read_vmstat_allocstall(&allocstall_total, &pgsteal_direct, &pgsteal_kswapd);
+
+        bool direct_reclaim_dominant = (pgsteal_direct > pgsteal_kswapd);
+
+        if (allocstall_total >= ALLOCSTALL_SIGNIFICANT_THRESHOLD || !direct_reclaim_dominant) {
+            mem_p = 100.0;
+        }
     }
 
     return mem_p >= VM_PRESSURE_CRITICAL;
@@ -346,7 +422,7 @@ static unsigned long find_victims(int* vindex) {
     
     DIR* d = opendir("/proc");
     if (!d) {
-        ALOGE("SLMK: Failed to open /proc: %s", strerror(errno));
+        ALOGE("Failed to open /proc: %s", strerror(errno));
         return 0;
     }
     
@@ -376,11 +452,11 @@ static unsigned long find_victims(int* vindex) {
     closedir(d);
     
     if (task_bucket.empty()) {
-        ALOGW("SLMK: No killable processes found");
+        ALOGW("No killable processes found");
         return 0;
     }
     
-    ALOGI("SLMK: Scanning from adj %d to %d", max_adj, min_adj);
+    ALOGI("Scanning from adj %d to %d", max_adj, min_adj);
     
     for (short adj = max_adj; adj >= min_adj; adj--) {
         auto it = task_bucket.find(adj);
@@ -456,16 +532,16 @@ void SimpleLmk::scan_and_kill() {
     pages_found = find_victims(&nr_found);
     
     if (nr_found == 0) {
-        ALOGE("SLMK: No processes available to kill!");
+        ALOGE("No processes available to kill!");
         return;
     }
     
-    ALOGI("SLMK: Found %d potential victims (%lu KB)", nr_found, pages_found);
+    ALOGI("Found %d potential victims (%lu KB)", nr_found, pages_found);
     
     if (pages_found > SLMK_PER_RECLAIM_MIN) {
         nr_to_kill = process_victims(nr_found, pages_found);
         
-        ALOGI("SLMK: First pass wants to kill %d victims", nr_to_kill);
+        ALOGI("First pass wants to kill %d victims", nr_to_kill);
         
         std::sort(victims_array.begin(), victims_array.begin() + nr_to_kill,
                  [](const proc_info& a, const proc_info& b) {
@@ -474,7 +550,7 @@ void SimpleLmk::scan_and_kill() {
         
         nr_to_kill = process_victims(nr_to_kill, pages_found);
         
-        ALOGI("SLMK: After optimization, killing %d victims", nr_to_kill);
+        ALOGI("After optimization, killing %d victims", nr_to_kill);
     } else {
         nr_to_kill = nr_found;
     }
@@ -489,7 +565,7 @@ void SimpleLmk::scan_and_kill() {
         pid_t pid = victim->pid;
         
         if (!is_pid_alive(pid)) {
-            ALOGD("SLMK: Process %d already dead", pid);
+            ALOGD("Process %d already dead", pid);
             nr_killed.fetch_add(1);
             continue;
         }
@@ -498,11 +574,11 @@ void SimpleLmk::scan_and_kill() {
         get_process_name(pid, comm, sizeof(comm));
 		
         if (!strncmp("com.wstxda.viper4android", comm, strlen(comm))) {
-            ALOGD("SLMK: Process %s is excluded", comm);
+            ALOGD("Process %s is excluded", comm);
             continue;
         }
         
-        ALOGI("SLMK: Killing %s (pid %d, adj %d) to free %lu KB",
+        ALOGI("Killing %s (pid %d, adj %d) to free %lu KB",
               comm, pid, victim->adj, victim->rss);
         
         kill(pid, SIGKILL);
@@ -518,9 +594,9 @@ void SimpleLmk::scan_and_kill() {
                 
                 int result = reaper_instance->kill({pidfd, pid, victim->uid}, false);
                 if (result == 0) {
-                    ALOGD("SLMK: Reaper took pid %d", pid);
+                    ALOGD("Reaper took pid %d", pid);
                 } else {
-                    ALOGW("SLMK: Reaper failed for pid %d", pid);
+                    ALOGW("Reaper failed for pid %d", pid);
                     close(pidfd);
                 }
             }
@@ -537,7 +613,7 @@ void SimpleLmk::scan_and_kill() {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC_COARSE, &now);
         if (get_time_diff_ms(&wait_start, &now) > RECLAIM_TIMEOUT_MS) {
-            ALOGI("SLMK: Timeout waiting for victims to die");
+            ALOGI("Timeout waiting for victims to die");
             timeout = true;
             break;
         }
@@ -556,7 +632,7 @@ void SimpleLmk::scan_and_kill() {
         freed_kb += victims_array[i].rss;
     }
     
-    ALOGI("SLMK: Killed %d/%d processes in %ld ms (freed ~%.1f MB)%s",
+    ALOGI("Killed %d/%d processes in %ld ms (freed ~%.1f MB)%s",
           killed, nr_to_kill, get_time_diff_ms(&start, &end),
           freed_kb / 1024.0, timeout ? " [TIMEOUT]" : "");
 }
@@ -564,13 +640,13 @@ void SimpleLmk::scan_and_kill() {
 void SimpleLmk::set_reaper(Reaper* reaper) {
     reaper_instance = reaper;
     if (reaper_instance) {
-        ALOGI("SLMK: Reaper configured");
+        ALOGI("Reaper configured");
     }
 }
 
 bool SimpleLmk::init(int comm_fd) {
     if (thread_cnt_ > 0) {
-        ALOGE("SLMK: Already initialized");
+        ALOGE("Already initialized");
         return false;
     }
 
@@ -582,26 +658,26 @@ bool SimpleLmk::init(int comm_fd) {
     for (int i = 0; i < THREAD_POOL_SIZE; i++) {
         if (pthread_create(&thread_pool_[thread_cnt_], nullptr, 
                           slmk_main, this) != 0) {
-            ALOGE("SLMK: pthread_create failed: %s", strerror(errno));
+            ALOGE("pthread_create failed: %s", strerror(errno));
             continue;
         }
         
         if (pthread_setschedparam(thread_pool_[thread_cnt_], 
                                  SCHED_RR, &param) != 0) {
-            ALOGW("SLMK: set SCHED_RR failed: %s", strerror(errno));
+            ALOGW("set SCHED_RR failed: %s", strerror(errno));
         }
         
         char name[16];
         snprintf(name, sizeof(name), "lmkd_slmk%d", thread_cnt_);
         if (pthread_setname_np(thread_pool_[thread_cnt_], name) != 0) {
-            ALOGW("SLMK: pthread_setname_np failed: %s", strerror(errno));
+            ALOGW("pthread_setname_np failed: %s", strerror(errno));
         }
         
         thread_cnt_++;
     }
 
     if (!thread_cnt_) {
-        ALOGE("SLMK: Failed to create any threads");
+        ALOGE("Failed to create any threads");
         delete[] thread_pool_;
         thread_pool_ = nullptr;
         return false;
@@ -609,7 +685,7 @@ bool SimpleLmk::init(int comm_fd) {
 
     comm_fd_ = comm_fd;
     victims_array.resize(SLMK_MAX_VICTIMS);
-    ALOGI("SLMK: Initialized with %d threads", thread_cnt_);
+    ALOGI("Initialized with %d threads", thread_cnt_);
     return true;
 }
 
@@ -622,7 +698,7 @@ void* slmk_main(void* param) {
     };
 
     if (!SetTaskProfiles(tid, {"CPUSET_SP_TOP_APP"}, true)) {
-        ALOGE("SLMK: Failed to assign cpuset to thread");
+        ALOGE("Failed to assign cpuset to thread");
     }
 
     cpu_set_t cpuset;
@@ -640,7 +716,7 @@ void* slmk_main(void* param) {
             if (*endptr == '\0' && cpu >= 0) {
                 cpus.push_back(static_cast<int32_t>(cpu));
             } else {
-                ALOGW("SLMK: Invalid CPU core value: %s", token.c_str());
+                ALOGW("Invalid CPU core value: %s", token.c_str());
             }
         }
     };
@@ -653,28 +729,28 @@ void* slmk_main(void* param) {
     }
  
     if (sched_setaffinity(tid, sizeof(cpu_set_t), &cpuset) != 0) {
-        ALOGW("SLMK: Failed to set thread CPU affinity to big cores");
+        ALOGW("Failed to set thread CPU affinity to big cores");
     } else {
-        ALOGI("SLMK: Successfully set thread CPU affinity to big cores");
+        ALOGI("Successfully set thread CPU affinity to big cores");
     }
 
     if (sched_setscheduler(tid, SCHED_RR, &slmk_param) != 0) {
-        ALOGW("SLMK: Failed to set scheduler: %s", strerror(errno));
+        ALOGW("Failed to set scheduler: %s", strerror(errno));
     }
 
-    ALOGI("SLMK: Monitor thread started (tid %d)", tid);
+    ALOGI("Monitor thread started (tid %d)", tid);
 
     for (;;) {
         sleep(1);
 
         if (is_memory_under_pressure()) {
-            ALOGI("SLMK: memory pressure. scanning");
+            ALOGI("memory pressure. scanning");
             bool expected = false;
             if (slmk->reclaim_pending_.compare_exchange_strong(expected, true)) {
                 slmk->scan_and_kill();
                 slmk->reclaim_pending_.store(false);
             } else {
-                ALOGD("SLMK: Reclaim already in progress");
+                ALOGD("Reclaim already in progress");
             }
         }
     }
